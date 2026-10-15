@@ -1,0 +1,715 @@
+---
+title: "ChatBots Motivations"
+output:
+  pdf_document: default
+  html_document: default
+date: "10-07-2026"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r Packages}
+library(haven)
+library(MASS)     
+library(dplyr)    
+library(car)    
+library(srvyr)
+library(pscl) 
+library(brant)
+library(tidyr)
+library(survey)
+library(openxlsx)
+library(psych)
+library(broom)
+library(purrr)
+library(flextable)
+library(officer)
+```
+```{r Import Data}
+ChatBots_DATA <- read_sav("ChatBots_DATA.sav")
+```
+
+#Score Variables
+```{r Score predictors}
+# Lifetime AI mental-health support use
+# Per the study denominator decision, missing Ai_support is counted as 0.
+ChatBots_DATA$AI_MH_lifetime_use <- ifelse(
+  ChatBots_DATA$Ai_support == 1, 1, 0
+)
+ChatBots_DATA$AI_MH_lifetime_use[
+  is.na(ChatBots_DATA$AI_MH_lifetime_use)
+] <- 0
+
+# PHQ-9
+ChatBots_DATA$PHQ9_total <- rowSums(
+  ChatBots_DATA[, paste0("Depression_", 1:9)],
+  na.rm = FALSE
+)
+ChatBots_DATA$PHQ9_cutoff <- ifelse(
+  ChatBots_DATA$PHQ9_total >= 10, 1, 0
+)
+
+# GAD-7
+ChatBots_DATA$GAD7_total <- rowSums(
+  ChatBots_DATA[, paste0("Anxiety_", 1:7)],
+  na.rm = FALSE
+)
+ChatBots_DATA$GAD7_cutoff <- ifelse(
+  ChatBots_DATA$GAD7_total >= 8, 1, 0
+)
+
+# Psychiatric diagnosis history
+# Retained for descriptives or other analyses; not in the final six-predictor models.
+ChatBots_DATA <- ChatBots_DATA %>%
+  mutate(
+    MH_diagnosis_yes = case_when(
+      Mental_health_diagnosis_a == 1 ~ 1,
+      Mental_health_diagnosis_a == 2 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+# K6 psychological distress
+ChatBots_DATA$K6_total <- rowSums(
+  ChatBots_DATA[, paste0("Psychological_Distress_", 1:6)],
+  na.rm = FALSE
+)
+ChatBots_DATA$K6_distress_recode <- ifelse(
+  ChatBots_DATA$K6_total >= 5, 1, 0
+)
+
+# Loneliness: mean of all three items; higher = greater loneliness.
+# A score is missing if any item is missing.
+loneliness_items <- paste0("Loneliness_", 1:3)
+ChatBots_DATA$Loneliness_mean <- rowMeans(
+  ChatBots_DATA[, loneliness_items],
+  na.rm = FALSE
+)
+
+# Unhappiness: reverse items 1–3; item 4 already points toward unhappiness.
+# All scored items range from 1 to 7; higher = greater unhappiness.
+ChatBots_DATA <- ChatBots_DATA %>%
+  mutate(
+    Happiness_1R = ifelse(
+      Happiness_1 %in% 1:7, 8 - Happiness_1, NA_real_
+    ),
+    Happiness_2R = ifelse(
+      Happiness_2 %in% 1:7, 8 - Happiness_2, NA_real_
+    ),
+    Happiness_3R = ifelse(
+      Happiness_3 %in% 1:7, 8 - Happiness_3, NA_real_
+    ),
+    Happiness_4_unhappy = ifelse(
+      Happiness_4 %in% 1:7, Happiness_4, NA_real_
+    )
+  )
+
+unhappiness_items <- c(
+  "Happiness_1R", "Happiness_2R",
+  "Happiness_3R", "Happiness_4_unhappy"
+)
+ChatBots_DATA$Unhappiness_continuous <- rowMeans(
+  ChatBots_DATA[, unhappiness_items],
+  na.rm = FALSE
+)
+
+# WHO-5 poor well-being: raw total of 0–25; <=12 indicates poor well-being.
+ChatBots_DATA$WHO5_total <- rowSums(
+  ChatBots_DATA[, paste0("Well_being_", 1:5)],
+  na.rm = FALSE
+)
+ChatBots_DATA$WHO5_poor <- ifelse(
+  ChatBots_DATA$WHO5_total <= 12, 1, 0
+)
+```
+```{r Score outcomes}
+# Reasons for using AI for mental-health support
+# 1 = selected; 0 = not selected; NA = not asked or missing
+reason_vars <- paste0("Ai_support_function_m_", 1:8)
+
+for (i in seq_along(reason_vars)) {
+  ChatBots_DATA[[paste0("Reason_", i)]] <- dplyr::case_when(
+    ChatBots_DATA[[reason_vars[i]]] == 1 ~ 1,
+    ChatBots_DATA[[reason_vars[i]]] == 2 ~ 0,
+    TRUE ~ NA_real_
+  )
+}
+
+# Apply the final decisions for the 25 "other" responses.
+# Dataset.Row refers to the row number in this specific source dataset.
+other_reason_decisions <- openxlsx::read.xlsx(
+  "MentalHealth_TextDATA/chatbot-mh_other-reasons_final-decisions.xlsx",
+  sheet = "Other Responses",
+  check.names = FALSE
+) %>%
+  dplyr::transmute(
+    Dataset_Row = as.integer(Dataset.Row),
+    Other_Response = as.character(Other.Response),
+    Decision = as.character(Decision),
+    Reason_Number = as.integer(sub("\\..*$", "", Decision))
+  )
+
+stopifnot(
+  nrow(other_reason_decisions) == 25,
+  !anyDuplicated(other_reason_decisions$Dataset_Row),
+  all(other_reason_decisions$Dataset_Row %in% seq_len(nrow(ChatBots_DATA))),
+  all(other_reason_decisions$Reason_Number %in% 1:8),
+  sum(other_reason_decisions$Reason_Number %in% 1:7) == 9,
+  all(
+    ChatBots_DATA$Ai_support_function_m_8[
+      other_reason_decisions$Dataset_Row
+    ] == 1
+  ),
+  all(
+    trimws(as.character(
+      ChatBots_DATA$Ai_support_function_m_t[
+        other_reason_decisions$Dataset_Row
+      ]
+    )) ==
+    trimws(other_reason_decisions$Other_Response)
+  )
+)
+
+# Reassign nine "other" responses to their agreed reasons.
+# Decisions of "8. Other" remain excluded from reasons 1–7.
+for (i in 1:7) {
+  recode_rows <- other_reason_decisions$Dataset_Row[
+    other_reason_decisions$Reason_Number == i
+  ]
+
+  ChatBots_DATA[[paste0("Reason_", i)]][recode_rows] <- 1
+}
+
+table(other_reason_decisions$Decision, useNA = "ifany")
+
+# Strategies for using AI for mental-health support
+# 1 = used at least a little; 0 = not used at all;
+# NA = not asked or missing
+strategy_vars <- paste0("Ai_support_type_", 1:8)
+
+for (i in seq_along(strategy_vars)) {
+  ChatBots_DATA[[paste0("Strategy_", i)]] <- dplyr::case_when(
+    ChatBots_DATA[[strategy_vars[i]]] == 1 ~ 0,
+    ChatBots_DATA[[strategy_vars[i]]] %in% 2:4 ~ 1,
+    TRUE ~ NA_real_
+  )
+}
+```
+```{r Score covariates}
+#Age
+ChatBots_DATA$age <- 2026 - ChatBots_DATA$birthyr
+
+#Daily Social Media use
+ChatBots_DATA$Daily_SM_use <- ifelse(
+  ChatBots_DATA$SM_Frequency_1 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_2 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_3 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_4 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_5 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_6 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_7 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_8 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_9 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_10 %in% c(4,5) |
+  ChatBots_DATA$SM_Frequency_11 %in% c(4,5),
+  1, 0
+)
+
+# Race/Ethnicity
+ChatBots_DATA <- ChatBots_DATA %>%
+  mutate(
+    race_model = case_when(
+      race == 1 ~ "White",
+      race == 2 ~ "Black",
+      race == 3 ~ "Hispanic",
+      race == 4 ~ "Asian",
+      race %in% c(5, 6, 7, 8) ~ "Multiracial or other",
+      TRUE ~ NA_character_
+    ),
+
+    race_model = factor(
+      race_model,
+      levels = c(
+        "White",
+        "Black",
+        "Hispanic",
+        "Asian",
+        "Multiracial or other"
+      )
+    )
+  )
+
+# Gender 
+ChatBots_DATA <- ChatBots_DATA %>%
+  mutate(
+    gender_model = case_when(
+      gender4 == 1 ~ "Man",
+      gender4 == 2 ~ "Woman",
+      gender4 %in% c(3, 4) ~ "Gender diverse",
+      TRUE ~ NA_character_
+    ),
+    gender_model = factor(
+      gender_model,
+      levels = c(
+        "Man",
+        "Woman",
+        "Gender diverse"
+      )
+    )
+  )
+
+# Education
+ChatBots_DATA <- ChatBots_DATA %>%
+  mutate(
+    educ_model = case_when(
+      educ %in% c(1, 2) ~ "High school or less",
+      educ %in% c(3, 4) ~ "Some college or 2-year degree",
+      educ %in% c(5, 6) ~ "4-year degree or higher",
+      TRUE ~ NA_character_
+    ),
+
+    educ_model = factor(
+      educ_model,
+      levels = c(
+        "High school or less",
+        "Some college or 2-year degree",
+        "4-year degree or higher"
+      )
+    )
+  )
+
+
+```
+```{r Means and cronbachs alphas}
+# Final continuous unhappiness score (higher = more unhappiness)
+ChatBots_DATA$Unhappiness_continuous <- rowMeans(
+  ChatBots_DATA[, c(
+    "Happiness_1R", "Happiness_2R",
+    "Happiness_3R", "Happiness_4_unhappy"
+  )],
+  na.rm = FALSE
+)
+
+# Full-sample weighted means and SDs
+scale_design <- survey::svydesign(
+  ids = ~1,
+  weights = ~weight,
+  data = ChatBots_DATA
+)
+
+for (score in c("Loneliness_mean", "Unhappiness_continuous")) {
+  score_formula <- stats::as.formula(paste0("~", score))
+  weighted_mean <- survey::svymean(score_formula, scale_design, na.rm = TRUE)
+  weighted_variance <- survey::svyvar(score_formula, scale_design, na.rm = TRUE)
+
+  cat(
+    score,
+    "| n =", sum(!is.na(ChatBots_DATA[[score]])),
+    "| weighted mean =", round(as.numeric(coef(weighted_mean))[1], 2),
+    "| weighted SD =", round(sqrt(as.numeric(weighted_variance)[1]), 2),
+    "\n"
+  )
+}
+
+# Conventional unweighted Cronbach alpha for the scored items
+loneliness_items <- ChatBots_DATA[, c(
+  "Loneliness_1", "Loneliness_2", "Loneliness_3"
+)]
+unhappiness_items <- ChatBots_DATA[, c(
+  "Happiness_1R", "Happiness_2R",
+  "Happiness_3R", "Happiness_4_unhappy"
+)]
+
+cat("Loneliness alpha =",
+    round(psych::alpha(loneliness_items, check.keys = FALSE)$total$raw_alpha, 3),
+    "\n")
+cat("Unhappiness alpha =",
+    round(psych::alpha(unhappiness_items, check.keys = FALSE)$total$raw_alpha, 3),
+    "\n")
+
+```
+
+#Create Survey Object
+```{r Survey weighted object}
+# Full-sample survey design
+design <- svydesign(
+  ids = ~1,
+  weights = ~weight,
+  data = ChatBots_DATA
+)
+
+```
+
+#Table 1: Prevalence for Reasons and Strategies
+```{r Table 1 full-sample prevalence}
+# Full-sample outcomes:
+# 1 = endorsed the reason/strategy
+# 0 = did not endorse it, or was coded as a nonuser
+# NA = a user whose response to that specific item is missing
+
+for (i in 1:7) {
+  source_var <- paste0("Reason_", i)
+  full_var <- paste0(source_var, "_full")
+
+  ChatBots_DATA[[full_var]] <- ifelse(
+    ChatBots_DATA$AI_MH_lifetime_use == 0,
+    0,
+    ChatBots_DATA[[source_var]]
+  )
+}
+
+for (i in 1:8) {
+  source_var <- paste0("Strategy_", i)
+  full_var <- paste0(source_var, "_full")
+
+  ChatBots_DATA[[full_var]] <- ifelse(
+    ChatBots_DATA$AI_MH_lifetime_use == 0,
+    0,
+    ChatBots_DATA[[source_var]]
+  )
+}
+
+# Rebuild the design so it contains the newly created _full outcomes.
+design_full <- survey::svydesign(
+  ids = ~1,
+  weights = ~weight,
+  data = ChatBots_DATA
+)
+
+# Rows in the order shown in manuscript Table 1.
+table1_key <- data.frame(
+  Group = c(rep("Reasons for use", 7), rep("Strategies used", 8)),
+  Outcome = c(
+    "Availability",
+    "Less judgment",
+    "More comfortable",
+    "Guidance",
+    "Easier than humans",
+    "Cheaper than therapy",
+    "Helps with loneliness",
+    "Plan of action",
+    "Find out more",
+    "Advice",
+    "Discuss feelings",
+    "Let out emotions",
+    "Emotional support",
+    "Look for the good",
+    "Understanding"
+  ),
+  Variable = c(
+    "Reason_1_full",
+    "Reason_2_full",
+    "Reason_4_full",
+    "Reason_6_full",
+    "Reason_3_full",
+    "Reason_7_full",
+    "Reason_5_full",
+    "Strategy_5_full",
+    "Strategy_4_full",
+    "Strategy_1_full",
+    "Strategy_2_full",
+    "Strategy_3_full",
+    "Strategy_6_full",
+    "Strategy_7_full",
+    "Strategy_8_full"
+  )
+)
+
+table1_results <- dplyr::bind_rows(
+  lapply(seq_len(nrow(table1_key)), function(i) {
+    var <- table1_key$Variable[i]
+    x <- ChatBots_DATA[[var]]
+
+    estimate <- survey::svymean(
+      stats::as.formula(paste0("~", var)),
+      design_full,
+      na.rm = TRUE
+    )
+    ci <- stats::confint(estimate)
+
+    data.frame(
+      Group = table1_key$Group[i],
+      Outcome = table1_key$Outcome[i],
+      N_available = sum(!is.na(x)),
+      `n (raw %)` = sprintf(
+        "%d (%.1f)",
+        sum(x == 1, na.rm = TRUE),
+        100 * mean(x == 1, na.rm = TRUE)
+      ),
+      `Weighted %` = sprintf("%.1f", 100 * coef(estimate)[1]),
+      `95% CI` = sprintf(
+        "%.1f–%.1f",
+        100 * ci[1, 1],
+        100 * ci[1, 2]
+      ),
+      check.names = FALSE
+    )
+  })
+)
+
+print(table1_results, row.names = FALSE)
+```
+
+#Table 2: Reasons Regressions Models
+```{r Table 2 regressions}
+# Continuous predictors, using the final scoring
+ChatBots_DATA$Unhappiness_continuous <- rowMeans(
+  ChatBots_DATA[, c(
+    "Happiness_1R", "Happiness_2R",
+    "Happiness_3R", "Happiness_4_unhappy"
+  )],
+  na.rm = FALSE
+)
+
+# Refresh the survey design so it contains the final predictors
+design_full <- survey::svydesign(
+  ids = ~1,
+  weights = ~weight,
+  data = ChatBots_DATA
+)
+
+mental_health_predictors <- c(
+  "PHQ9_cutoff",
+  "GAD7_cutoff",
+  "K6_distress_recode",
+  "Loneliness_mean",
+  "Unhappiness_continuous",
+  "WHO5_poor"
+)
+
+covariates <- c(
+  "age", "gender_model", "race_model",
+  "educ_model", "Daily_SM_use"
+)
+
+reason_outcomes <- paste0("Reason_", 1:7, "_full")
+strategy_outcomes <- paste0("Strategy_", 1:8, "_full")
+all_outcomes <- c(reason_outcomes, strategy_outcomes)
+
+fit_model <- function(outcome) {
+  model_formula <- stats::reformulate(
+    c(mental_health_predictors, covariates),
+    response = outcome
+  )
+
+  survey::svyglm(
+    model_formula,
+    design = design_full,
+    family = quasibinomial(),
+    na.action = na.omit
+  )
+}
+
+all_models <- setNames(
+  lapply(all_outcomes, fit_model),
+  all_outcomes
+)
+
+extract_focal_results <- function(model, outcome) {
+  coefficient_table <- summary(model)$coefficients
+  p_column <- grep("^Pr\\(", colnames(coefficient_table), value = TRUE)
+  confidence_intervals <- confint(
+    model,
+    parm = mental_health_predictors,
+    level = 0.95
+  )
+
+  data.frame(
+    Outcome = outcome,
+    Predictor = mental_health_predictors,
+    N = nobs(model),
+    aOR = exp(coefficient_table[
+      mental_health_predictors, "Estimate"
+    ]),
+    CI_low = exp(confidence_intervals[
+      mental_health_predictors, 1
+    ]),
+    CI_high = exp(confidence_intervals[
+      mental_health_predictors, 2
+    ]),
+    p_raw = coefficient_table[
+      mental_health_predictors, p_column
+    ],
+    row.names = NULL
+  )
+}
+
+all_results <- dplyr::bind_rows(
+  lapply(names(all_models), function(outcome) {
+    extract_focal_results(all_models[[outcome]], outcome)
+  })
+) %>%
+  dplyr::mutate(
+    p_BH = p.adjust(p_raw, method = "BH"),
+    Significant_BH = p_BH < 0.05
+  )
+
+# QA: exactly 15 models × 6 focal predictors = 90 tests
+stopifnot(
+  length(all_models) == 15,
+  nrow(all_results) == 90,
+  all(table(all_results$Outcome) == 6)
+)
+
+# Table 2, in manuscript column order
+reason_order <- c(
+  "Reason_1_full", # Availability
+  "Reason_2_full", # Less judgment
+  "Reason_3_full", # Easier than humans
+  "Reason_4_full", # More comfortable
+  "Reason_5_full", # Helps with loneliness
+  "Reason_6_full", # Guidance
+  "Reason_7_full"  # Cheaper than therapy
+)
+
+table2_results <- all_results %>%
+  dplyr::filter(Outcome %in% reason_order) %>%
+  dplyr::mutate(
+    Outcome = factor(Outcome, levels = reason_order),
+    Predictor = factor(
+      Predictor,
+      levels = mental_health_predictors,
+      labels = c(
+        "Depression", "Anxiety", "Psychological distress",
+        "Loneliness", "Unhappiness", "Poor well-being"
+      )
+    ),
+    Cell = sprintf(
+      "%.2f (%.2f–%.2f); p%s",
+      aOR, CI_low, CI_high,
+      ifelse(p_BH < .001, "<.001",
+             paste0("=", sprintf("%.3f", p_BH)))
+    )
+  ) %>%
+  dplyr::arrange(Predictor, Outcome)
+
+# Audit version: all 42 Table 2 associations
+print(
+  tibble::as_tibble(
+    table2_results %>%
+      dplyr::select(
+        Predictor, Outcome, N, aOR, CI_low, CI_high,
+        p_raw, p_BH, Significant_BH
+      )
+  ),
+  n = Inf,
+  width = Inf
+)
+
+# Manuscript-style layout
+table2_display <- table2_results %>%
+  dplyr::select(Predictor, Outcome, Cell) %>%
+  tidyr::pivot_wider(
+    names_from = Outcome,
+    values_from = Cell
+  )
+
+print(tibble::as_tibble(table2_display), width = Inf)
+```
+
+#Table 3: 
+```{r Table 3 regressions}
+strategy_order <- c(
+  "Strategy_1_full", # Advice
+  "Strategy_2_full", # Discuss feelings
+  "Strategy_3_full", # Let out emotions
+  "Strategy_4_full", # Find out more
+  "Strategy_5_full", # Plan of action
+  "Strategy_6_full", # Emotional support
+  "Strategy_7_full", # Look for the good
+  "Strategy_8_full"  # Understanding
+)
+
+table3_results <- all_results %>%
+  dplyr::filter(Outcome %in% strategy_order) %>%
+  dplyr::mutate(
+    Outcome = factor(Outcome, levels = strategy_order),
+    Predictor = factor(
+      Predictor,
+      levels = mental_health_predictors,
+      labels = c(
+        "Depression", "Anxiety", "Psychological distress",
+        "Loneliness", "Unhappiness", "Poor well-being"
+      )
+    ),
+    Cell = sprintf(
+      "%.2f (%.2f–%.2f); p%s",
+      aOR, CI_low, CI_high,
+      ifelse(
+        p_BH < .001,
+        "<.001",
+        paste0("=", sprintf("%.3f", p_BH))
+      )
+    )
+  ) %>%
+  dplyr::arrange(Predictor, Outcome)
+
+# QA: 8 outcomes × 6 focal predictors = 48 Table 3 cells
+stopifnot(
+  nrow(table3_results) == 48,
+  all(table(table3_results$Outcome) == 6)
+)
+
+# Audit version, including model N and unrounded values
+print(
+  tibble::as_tibble(
+    table3_results %>%
+      dplyr::select(
+        Predictor, Outcome, N, aOR, CI_low, CI_high,
+        p_raw, p_BH, Significant_BH
+      )
+  ),
+  n = Inf,
+  width = Inf
+)
+
+# Manuscript-style layout
+table3_display <- table3_results %>%
+  dplyr::select(Predictor, Outcome, Cell) %>%
+  tidyr::pivot_wider(
+    names_from = Outcome,
+    values_from = Cell
+  )
+
+print(tibble::as_tibble(table3_display), width = Inf)
+```
+
+#Variance Inflation Factor
+```{r VIF}
+vif_data <- ChatBots_DATA %>%
+  dplyr::select(
+    dplyr::all_of(c(mental_health_predictors, covariates))
+  ) %>%
+  tidyr::drop_na()
+
+final_predictor_vif <- dplyr::bind_rows(
+  lapply(mental_health_predictors, function(predictor) {
+    auxiliary_model <- stats::lm(
+      stats::reformulate(
+        c(setdiff(mental_health_predictors, predictor), covariates),
+        response = predictor
+      ),
+      data = vif_data
+    )
+
+    r_squared <- summary(auxiliary_model)$r.squared
+
+    tibble::tibble(
+      Predictor = predictor,
+      N = stats::nobs(auxiliary_model),
+      VIF = 1 / (1 - r_squared)
+    )
+  })
+) %>%
+  dplyr::arrange(dplyr::desc(VIF))
+
+print(final_predictor_vif)
+range(final_predictor_vif$VIF)
+```
+
+
+
+
+
+
+
